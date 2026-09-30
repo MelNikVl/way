@@ -3,9 +3,10 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { openDatabase, RevisionConflict, StateValidationError } from './database.mjs';
+import { createAIBridge, AIReviewValidationError, AIReviewConflict } from './ai-bridge.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
-const publicFiles = new Set(['index.html', 'styles.css', 'app.mjs', 'content.mjs', 'core.mjs', 'evidence.mjs', 'sync.mjs', 'personal-plan.mjs', 'budget.mjs', 'favicon.svg']);
+const publicFiles = new Set(['index.html', 'styles.css', 'app.mjs', 'content.mjs', 'core.mjs', 'evidence.mjs', 'sync.mjs', 'personal-plan.mjs', 'budget.mjs', 'today.mjs', 'favicon.svg']);
 const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.json': 'application/json; charset=utf-8' };
 const MAX_BODY_BYTES = 2_000_000;
 const responseHeaders = {
@@ -62,6 +63,12 @@ function readJSON(req) {
 /** Create an isolated local server; importing this module never opens a port. */
 export function createServer({ dataDir, now } = {}) {
   const storage = openDatabase({ dataDir, now });
+  const ai = createAIBridge({ dataDir: storage.dataDir, now });
+  const refreshAIExport = () => {
+    try { return ai.exportSnapshot(storage.read()); }
+    catch { return { ...ai.status(), ok: false, error: 'Выгрузка AI не обновлена; сохранение данных приложения проверяется отдельно.' }; }
+  };
+  refreshAIExport();
   const server = http.createServer(async (req, res) => {
     try {
       const origin = validateRequestSource(req);
@@ -73,12 +80,32 @@ export function createServer({ dataDir, now } = {}) {
         if (req.headers['x-way-client'] !== 'local-v1') throw new HTTPError(403, 'Отсутствует заголовок локального приложения.');
         if (url.pathname === '/api/state' && req.method === 'GET') { sendJSON(res, 200, storage.read()); return; }
         if (url.pathname === '/api/backups' && req.method === 'GET') { sendJSON(res, 200, storage.listBackups()); return; }
+        if (url.pathname === '/api/ai/export' && req.method === 'GET') { sendJSON(res, 200, ai.status(storage.read().revision)); return; }
+        if (url.pathname === '/api/ai/export' && req.method === 'POST') {
+          const input = await readJSON(req);
+          if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length) throw new HTTPError(400, 'Обновление выгрузки принимает пустой объект JSON.');
+          sendJSON(res, 200, refreshAIExport()); return;
+        }
+        if (url.pathname === '/api/ai/context' && req.method === 'GET') {
+          if (!ai.status().ok) throw new HTTPError(503, 'Выгрузка контекста AI недоступна; проверьте /api/ai/export. Данные приложения сохранены отдельно.');
+          res.writeHead(200, { ...responseHeaders, 'Content-Type': 'text/markdown; charset=utf-8' });
+          res.end(ai.contextMarkdown()); return;
+        }
+        if (url.pathname === '/api/ai/review' && req.method === 'GET') { sendJSON(res, 200, ai.readReview(storage.read().revision)); return; }
+        if (url.pathname === '/api/ai/review' && req.method === 'POST') {
+          const input = await readJSON(req);
+          if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 1 || !Object.hasOwn(input, 'review')) throw new HTTPError(400, 'Ожидалось единственное поле review.');
+          const result = ai.writeReview(input.review, storage.read().revision);
+          sendJSON(res, 200, { ...result, aiExport: refreshAIExport() }); return;
+        }
         if (url.pathname === '/api/state' && req.method === 'POST') {
           const input = await readJSON(req);
           if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['state', 'baseRevision'].includes(key)) || !Object.hasOwn(input, 'state') || !Object.hasOwn(input, 'baseRevision')) throw new HTTPError(400, 'Ожидались поля state и baseRevision.');
-          sendJSON(res, 200, storage.write(input.state, input.baseRevision)); return;
+          const result = storage.write(input.state, input.baseRevision);
+          // Export failure is independent of the already committed DB write.
+          sendJSON(res, 200, { ...result, aiExport: refreshAIExport() }); return;
         }
-        throw new HTTPError(['/api/state', '/api/backups'].includes(url.pathname) ? 405 : 404, 'Метод или адрес API не поддерживается.');
+        throw new HTTPError(['/api/state', '/api/backups', '/api/ai/export', '/api/ai/context', '/api/ai/review'].includes(url.pathname) ? 405 : 404, 'Метод или адрес API не поддерживается.');
       }
       if (!['GET', 'HEAD'].includes(req.method)) throw new HTTPError(405, 'Метод не поддерживается.');
       let file;
@@ -94,6 +121,8 @@ export function createServer({ dataDir, now } = {}) {
     } catch (error) {
       if (res.destroyed || res.headersSent) return;
       if (error instanceof RevisionConflict) { sendJSON(res, 409, { error: error.message, ...error.current }); return; }
+      if (error instanceof AIReviewConflict) { sendJSON(res, 409, { ...error.current, error: error.message }); return; }
+      if (error instanceof AIReviewValidationError) { sendJSON(res, 400, { error: error.message }); return; }
       if (error instanceof StateValidationError) { sendJSON(res, 400, { error: error.message }); return; }
       if (error instanceof HTTPError) { sendJSON(res, error.status, { error: error.message }); return; }
       sendJSON(res, 500, { error: 'Локальная база или файл недоступны. Сохранение не подтверждено; сохраните резервную копию и повторите запрос.' });
