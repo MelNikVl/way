@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildPersonalPlan } from './personal-plan.mjs';
+import { buildPersonalPlan, personalIncomeProgress } from './personal-plan.mjs';
 
 const date = key => new Date(`${key}T12:00:00`);
 const state = () => ({
@@ -244,4 +244,141 @@ test('the function is pure and private facts are returned only from provided con
   assert.deepEqual(build(s, null).factBasis, []);
   assert.equal(build(s, null).financial.startingCapital, null);
   assert.throws(() => buildPersonalPlan(s, c, new Date('invalid')));
+});
+
+function coaching() {
+  return {
+    reviewedAt: '2026-09-30', summary: 'A reviewed experiment.',
+    incomeCheckpoints: [{ id: 'income-week', horizon: 'week', due: '2026-10-07', title: 'Test the offer',
+      targetIncome: { amount: 0, currency: 'USD', scope: 'personal', period: 'month', basis: 'net' },
+      criteria: ['Have one useful conversation.'], action: 'Write one invitation.' }],
+    weeklyRhythm: [{ day: 1, title: 'Rest', minutes: 0, action: 'Keep the day free.', minimum: 'Pause.', output: 'Recovery.' }],
+    habitPrescriptions: [{ id: 'coach-market', title: 'One useful action', cue: 'After breakfast', minimum: 'Open the draft', target: 3, why: 'Make starting easier.' }],
+    metrics: [{ id: 'market', label: 'Conversations', baseline: 'Not measured', target: 'One per week', measurement: 'Count completed conversations', frequency: 'Weekly' }],
+    reviewRules: ['Review actual results.'], safeguards: ['Stay within the agreed time budget.'],
+  };
+}
+function coached(raw = coaching(), s = state()) {
+  const c = context(); c.currentPlan = { direction: 'product', coaching: raw };
+  return build(s, c);
+}
+
+test('reviewed coaching is detached display data; explicit zero and unknown income are preserved', () => {
+  const raw = coaching(), s = state(), before = JSON.stringify({ raw, s });
+  const p = coached(raw, s);
+  assert.deepEqual(p.coaching, raw);
+  assert.equal(p.coaching.incomeCheckpoints[0].targetIncome.amount, 0);
+  assert.equal(p.coaching.weeklyRhythm[0].minutes, 0);
+  assert.equal(p.financial.expenses, null);
+  assert.equal(JSON.stringify({ raw, s }), before);
+  p.coaching.incomeCheckpoints[0].criteria.push('Changed in returned result only');
+  p.coaching.habitPrescriptions[0].title = 'Changed';
+  assert.equal(raw.incomeCheckpoints[0].criteria.length, 1);
+  assert.equal(raw.habitPrescriptions[0].title, 'One useful action');
+  raw.incomeCheckpoints[0].targetIncome = null;
+  assert.equal(coached(raw).coaching.incomeCheckpoints[0].targetIncome, null);
+});
+
+test('coaching rejects malformed or incomplete rows without manufacturing numbers or observations', () => {
+  const raw = coaching();
+  raw.reviewedAt = '2026-02-30';
+  raw.incomeCheckpoints.push({ ...raw.incomeCheckpoints[0], id: 'bad-date', due: '2026-02-30' });
+  raw.incomeCheckpoints[0].targetIncome = { amount: '500', currency: 'USD' };
+  raw.weeklyRhythm.push({ day: 2, title: 'Incomplete' }, { day: 8, title: 'Invalid', action: 'Nothing', minutes: 20 });
+  raw.habitPrescriptions.push({ id: 'constructor', title: 'Invalid', cue: 'Now', minimum: 'Open', target: 2 }, { id: 'too-often', title: 'Invalid', cue: 'Now', minimum: 'Open', target: 8 });
+  raw.metrics[0].baseline = 0; raw.metrics[0].target = { score: 10 };
+  raw.metrics.push({ id: 'missing', label: 'No measurement' });
+  raw.reviewRules = [null, 0, '', '  Keep this  '];
+  const p = coached(raw).coaching;
+  assert.equal(p.reviewedAt, null);
+  assert.equal(p.incomeCheckpoints.length, 1);
+  assert.equal(p.incomeCheckpoints[0].targetIncome, null);
+  assert.equal(p.weeklyRhythm.length, 1);
+  assert.equal(p.habitPrescriptions.length, 1);
+  assert.equal(p.metrics.length, 1);
+  assert.equal(p.metrics[0].baseline, '');
+  assert.equal(p.metrics[0].target, '');
+  assert.deepEqual(p.reviewRules, ['Keep this']);
+});
+
+test('coaching bounds text and arrays, deduplicates identities, and allows only display fields', () => {
+  const raw = coaching(), checkpoint = raw.incomeCheckpoints[0], habit = raw.habitPrescriptions[0], metric = raw.metrics[0];
+  raw.summary = 'x'.repeat(2500);
+  raw.incomeCheckpoints = Array.from({ length: 9 }, (_, i) => ({ ...checkpoint, id: `checkpoint-${i}` }));
+  raw.weeklyRhythm = [{ ...raw.weeklyRhythm[0] }, ...Array.from({ length: 8 }, (_, i) => ({ ...raw.weeklyRhythm[0], day: i + 1 }))];
+  raw.habitPrescriptions = [habit, habit, { ...habit, id: 'second' }, { ...habit, id: 'third' }];
+  raw.metrics = Array.from({ length: 12 }, (_, i) => ({ ...metric, id: `metric-${i}` }));
+  raw.safeguards = Array(12).fill('x');
+  const html = '<img src=x onerror=alert(1)>';
+  raw.incomeCheckpoints[0].title = html;
+  raw.incomeCheckpoints[0].html = html;
+  raw.habitPrescriptions[0].active = true;
+  raw.untrustedHTML = html;
+  const p = coached(raw).coaching;
+  assert.equal(p.summary.length, 2000);
+  assert.equal(p.incomeCheckpoints.length, 5);
+  assert.equal(p.weeklyRhythm.length, 7);
+  assert.equal(p.habitPrescriptions.length, 2);
+  assert.equal(p.metrics.length, 8);
+  assert.equal(p.safeguards.length, 8);
+  // Text is kept literal for the UI's esc(); no raw HTML property reaches it.
+  assert.equal(p.incomeCheckpoints[0].title, html);
+  assert.equal('html' in p.incomeCheckpoints[0], false);
+  assert.equal('untrustedHTML' in p, false);
+  assert.equal('active' in p.habitPrescriptions[0], false);
+});
+
+test('coaching belongs only to its reviewed direction and never reads free-text answers as code', () => {
+  const s = state(); s.answers.focusDirection = 'career';
+  assert.equal(coached(coaching(), s).coaching, null);
+  s.answers.focusDirection = 'product';
+  assert.ok(coached(coaching(), s).coaching);
+  for (const invalid of [null, 'text', [], 1]) assert.equal(coached(invalid).coaching, null);
+  assert.equal(build().coaching, null);
+  assert.deepEqual(coached({}).coaching, { reviewedAt: null, summary: '', incomeCheckpoints: [], weeklyRhythm: [], habitPrescriptions: [], metrics: [], reviewRules: [], safeguards: [] });
+});
+
+test('personal income stays unknown without three full months and never inherits family figures', () => {
+  const s = state(); s.profile.income = 9000; s.finances['2026-08'] = { income: 10000 };
+  s.answers = { personalIncome_USD_2026_08: '100', 'personalIncome_USD_2026-06': '', 'personalIncome_USD_2026-07': 'unknown',
+    'personalIncome_USD_2026-08': '0', 'personalIncome_USD_2026-09': '250' };
+  const before = JSON.stringify(s);
+  const result = personalIncomeProgress(s, 'USD', date('2026-09-30'));
+  assert.deepEqual(result.periodMonths, ['2026-06', '2026-07', '2026-08']);
+  assert.equal(result.observationCount, 1);
+  assert.equal(result.threeMonthAverage, null);
+  assert.equal(result.latestMonth, '2026-09');
+  assert.equal(result.latestAmount, 250);
+  assert.deepEqual(result.records, [{ month: '2026-09', amount: 250 }, { month: '2026-08', amount: 0 }]);
+  assert.equal(JSON.stringify(s), before);
+  const empty = personalIncomeProgress({}, 'USD', date('2026-09-30'));
+  assert.equal(empty.latestMonth, null); assert.equal(empty.latestAmount, null); assert.equal(empty.observationCount, 0);
+});
+
+test('personal income average uses only previous full months across a new year, including real zeros', () => {
+  const s = { answers: { 'personalIncome_USD_2025-10': '0', 'personalIncome_USD_2025-11': '150',
+    'personalIncome_USD_2025-12': '300.50', 'personalIncome_USD_2026-01': '99000',
+    'personalIncome_USD_2026-02': '50000', 'personalIncome_USD_2025-09': '25' } };
+  const result = personalIncomeProgress(s, 'USD', date('2026-01-01'));
+  assert.deepEqual(result.periodMonths, ['2025-10', '2025-11', '2025-12']);
+  assert.equal(result.observationCount, 3);
+  assert.equal(result.threeMonthAverage, 150.17);
+  assert.equal(result.latestAmount, 99000);
+  assert.equal(result.records.length, 5);
+  assert.equal(result.records.some(item => item.month === '2026-02'), false);
+});
+
+test('personal income currencies are independent and invalid numeric or month values remain unknown', () => {
+  const s = { answers: { 'personalIncome_USD_2026-08': '1000000000000', 'personalIncome_KZT_2026-08': '0',
+    'personalIncome_RUB_2026-08': '250,75', 'personalIncome_USD_2026-07': '-1',
+    'personalIncome_USD_2026-06': '1000000000001', 'personalIncome_USD_2026-05': 200,
+    'personalIncome_USD_2026-04': 'Infinity', 'personalIncome_USD_2026-13': '5',
+    'personalIncome_USD_2026-00': '5', 'personalIncome_USD_2026-1': '5', 'personalIncome_EUR_2026-09': '500' } };
+  const now = date('2026-09-30');
+  const usd = personalIncomeProgress(s, 'USD', now);
+  assert.deepEqual(usd.records, [{ month: '2026-08', amount: 1e12 }]);
+  assert.equal(personalIncomeProgress(s, 'KZT', now).latestAmount, 0);
+  assert.equal(personalIncomeProgress(s, 'RUB', now).latestAmount, 250.75);
+  assert.throws(() => personalIncomeProgress(s, 'EUR', now), TypeError);
+  assert.throws(() => personalIncomeProgress(s, 'USD', new Date('invalid')), TypeError);
 });

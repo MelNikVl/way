@@ -5,7 +5,7 @@ import path from 'node:path';
 import { openDatabase, RevisionConflict, StateValidationError } from './database.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
-const publicFiles = new Set(['index.html', 'styles.css', 'app.mjs', 'content.mjs', 'core.mjs', 'evidence.mjs', 'sync.mjs', 'personal-plan.mjs', 'favicon.svg']);
+const publicFiles = new Set(['index.html', 'styles.css', 'app.mjs', 'content.mjs', 'core.mjs', 'evidence.mjs', 'sync.mjs', 'personal-plan.mjs', 'budget.mjs', 'favicon.svg']);
 const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.json': 'application/json; charset=utf-8' };
 const MAX_BODY_BYTES = 2_000_000;
 const responseHeaders = {

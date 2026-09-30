@@ -9,6 +9,59 @@ const moneyValue = value => known(value) && value >= 0 ? value : null;
 const text = value => typeof value === 'string' ? value.trim() : '';
 const round = value => known(value) ? Math.round((value + Number.EPSILON) * 100) / 100 : null;
 
+/** Reviewed guidance is display data, never an automatic edit to answers or observations. */
+function sanitizeCoaching(input) {
+  const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (!record(input)) return null;
+  const plain = (value, limit = 2000) => text(value).slice(0, limit);
+  const id = value => typeof value === 'string' && /^[A-Za-z][A-Za-z0-9_-]{0,79}$/.test(value)
+    && !['constructor', 'prototype', '__proto__'].includes(value) ? value : null;
+  const strings = (value, limit = 8) => Array.isArray(value)
+    ? value.slice(0, 100).filter(item => typeof item === 'string').map(item => plain(item)).filter(Boolean).slice(0, limit) : [];
+  const rows = (value, limit, convert, identity = item => item.id) => {
+    if (!Array.isArray(value)) return [];
+    const result = [], seen = new Set();
+    for (const raw of value.slice(0, 100)) {
+      if (!record(raw)) continue;
+      const item = convert(raw);
+      if (!item || seen.has(identity(item))) continue;
+      seen.add(identity(item)); result.push(item);
+      if (result.length === limit) break;
+    }
+    return result;
+  };
+  const income = value => record(value) && known(value.amount) && value.amount >= 0 && value.amount <= 1e15
+    && ['USD', 'RUB', 'KZT'].includes(value.currency) && ['personal', 'family'].includes(value.scope)
+    && value.period === 'month' && value.basis === 'net'
+    ? { amount: value.amount, currency: value.currency, scope: value.scope, period: 'month', basis: 'net' } : null;
+  return {
+    reviewedAt: validKey(input.reviewedAt), summary: plain(input.summary),
+    incomeCheckpoints: rows(input.incomeCheckpoints, 5, item => {
+      const key = id(item.id), due = validKey(item.due), title = plain(item.title, 300);
+      if (!key || !due || !title || !['week', 'month', 'halfyear', 'year', 'fiveyears'].includes(item.horizon)) return null;
+      return { id: key, horizon: item.horizon, due, title, targetIncome: income(item.targetIncome),
+        criteria: strings(item.criteria), action: plain(item.action) };
+    }),
+    weeklyRhythm: rows(input.weeklyRhythm, 7, item => {
+      const title = plain(item.title, 300), action = plain(item.action);
+      if (!Number.isInteger(item.day) || item.day < 1 || item.day > 7 || !title || !action
+        || !known(item.minutes) || item.minutes < 0 || item.minutes > 1440) return null;
+      return { day: item.day, title, minutes: item.minutes, action, minimum: plain(item.minimum), output: plain(item.output) };
+    }, item => item.day),
+    habitPrescriptions: rows(input.habitPrescriptions, 2, item => {
+      const key = id(item.id), title = plain(item.title, 300), cue = plain(item.cue, 1000), minimum = plain(item.minimum, 1000);
+      if (!key || !title || !cue || !minimum || !Number.isInteger(item.target) || item.target < 1 || item.target > 7) return null;
+      return { id: key, title, cue, minimum, target: item.target, why: plain(item.why) };
+    }),
+    metrics: rows(input.metrics, 8, item => {
+      const key = id(item.id), label = plain(item.label, 300), measurement = plain(item.measurement), frequency = plain(item.frequency, 300);
+      if (!key || !label || !measurement || !frequency) return null;
+      return { id: key, label, baseline: plain(item.baseline), target: plain(item.target), measurement, frequency };
+    }),
+    reviewRules: strings(input.reviewRules), safeguards: strings(input.safeguards),
+  };
+}
+
 function dayKey(date) {
   if (!(date instanceof Date) || !Number.isFinite(date.getTime())) throw new TypeError('Некорректная дата расчёта.');
   return `${String(date.getFullYear()).padStart(4, '0')}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
@@ -54,6 +107,32 @@ function numericAnswer(value, allowNegative = false) {
   const number = Number(source);
   return Number.isFinite(number) && Math.abs(number) <= 1e15 && (allowNegative || number >= 0) ? number : null;
 }
+
+/** Separate personal net-income observations; never infer them from household finances. */
+export function personalIncomeProgress(state = {}, currency = 'USD', today = new Date()) {
+  if (!['USD', 'KZT', 'RUB'].includes(currency)) throw new TypeError('Неподдерживаемая валюта личного дохода.');
+  const currentMonth = dayKey(today).slice(0, 7);
+  const periodMonths = [3, 2, 1].map(offset => addMonths(`${currentMonth}-01`, -offset).slice(0, 7));
+  const prefix = `personalIncome_${currency}_`;
+  const records = [];
+  for (const [key, value] of Object.entries(state?.answers || {})) {
+    if (!key.startsWith(prefix)) continue;
+    const month = key.slice(prefix.length);
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month) || month > currentMonth) continue;
+    const amount = numericAnswer(value);
+    if (amount !== null && amount <= 1e12) records.push({ month, amount });
+  }
+  records.sort((a, b) => b.month.localeCompare(a.month));
+  const byMonth = new Map(records.map(item => [item.month, item.amount]));
+  const observations = periodMonths.filter(month => byMonth.has(month));
+  return {
+    currency, latestMonth: records[0]?.month ?? null, latestAmount: records[0]?.amount ?? null,
+    periodMonths, observationCount: observations.length,
+    threeMonthAverage: observations.length === 3 ? round(periodMonths.reduce((sum, month) => sum + byMonth.get(month), 0) / 3) : null,
+    records,
+  };
+}
+
 function selectedRecord(state, now) {
   const month = Object.keys(state.finances || {}).filter(key => /^\d{4}-(0[1-9]|1[0-2])$/.test(key) && key <= now.slice(0, 7)).sort().at(-1) || null;
   return { record: month ? state.finances[month] : (state.profile || {}), month };
@@ -147,7 +226,9 @@ const DIRECTIONS = {
  * Context valuation is an explicitly supplied, dated reference quote; this
  * function never fetches or assumes a current exchange rate.
  * Optional currentPlan is a manually reviewed personalization, not an inference
- * from free-text answers: { direction, reason, nextStep, facts: [...] }.
+ * from free-text answers: { direction, reason, nextStep, facts: [...], coaching }.
+ * Coaching remains bounded plain-text display data. The renderer must escape
+ * its text; accepting any proposed habit is a separate explicit state mutation.
  */
 export function buildPersonalPlan(state = {}, context = null, today = new Date()) {
   const now = dayKey(today), profile = state.profile || {}, answers = state.answers || {};
@@ -267,7 +348,7 @@ export function buildPersonalPlan(state = {}, context = null, today = new Date()
       annualCheckpoints,
       limitation: 'Требуемые накопления, не прогноз. Оценка имущества приблизительна; курс и стоимость могут измениться. Семейный доход должен быть полным, расходы — измеренными. Финансовые цели не заменяют здоровье, отношения и собственный выбор.',
     },
-    focus, milestones,
+    focus, milestones, coaching: sanitizeCoaching(matchingReviewedPlan?.coaching),
     factBasis: facts.filter(item => item && typeof item.title === 'string').map(item => ({ title: item.title, detail: text(item.detail), url: text(item.url) })),
   };
 }
